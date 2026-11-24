@@ -109,6 +109,61 @@ public enum AudioDeviceManager {
         return status == noErr
     }
 
+    public static func gainFromScalar(_ scalar: Float, muted: Bool) -> Float {
+        if muted || scalar <= 0.0 { return 0.0 }
+        if scalar >= 1.0 { return 1.0 }
+        let db = (scalar - 1.0) * 60.0
+        return powf(10.0, db / 20.0)
+    }
+
+    public static func readVolumeScalar(deviceID: AudioDeviceID) -> Float {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyVolumeScalar,
+            mScope: kAudioObjectPropertyScopeOutput,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var scalar: Float32 = 0.75
+        var size = UInt32(MemoryLayout<Float32>.size)
+        if AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &scalar) == noErr {
+            return scalar
+        }
+        return 0.75
+    }
+
+    public static func readMute(deviceID: AudioDeviceID) -> Bool {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyMute,
+            mScope: kAudioObjectPropertyScopeOutput,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var muted: UInt32 = 0
+        var size = UInt32(MemoryLayout<UInt32>.size)
+        if AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &muted) == noErr {
+            return muted != 0
+        }
+        return false
+    }
+
+    public static func currentProcessAudioObjectID() -> AudioObjectID? {
+        var pid = ProcessInfo.processInfo.processIdentifier
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyTranslatePIDToProcessObject,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var objID: AudioObjectID = kAudioObjectUnknown
+        var size = UInt32(MemoryLayout<AudioObjectID>.size)
+        let status = AudioObjectGetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject),
+            &address,
+            UInt32(MemoryLayout<pid_t>.size),
+            &pid,
+            &size,
+            &objID
+        )
+        return (status == noErr && objID != kAudioObjectUnknown) ? objID : nil
+    }
+
     private static func hasOutputChannels(deviceID: AudioDeviceID) -> Bool {
         var address = AudioObjectPropertyAddress(
             mSelector: kAudioDevicePropertyStreamConfiguration,

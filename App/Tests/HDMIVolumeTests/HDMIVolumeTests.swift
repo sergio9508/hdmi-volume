@@ -84,4 +84,13 @@ struct HDMIVolumeTests {
         output.withUnsafeMutableBufferPointer { ring.read(into: $0.baseAddress!, count: 4) }
         #expect(output == [3, 3, 4, 4])
     }
+
+    @Test("gainFromScalar matches perceptual -60dB..0dB curve and mute")
+    func gainCurve() {
+        #expect(AudioDeviceManager.gainFromScalar(0.0, muted: false) == 0.0)
+        #expect(AudioDeviceManager.gainFromScalar(0.8, muted: true) == 0.0)
+        #expect(AudioDeviceManager.gainFromScalar(1.0, muted: false) == 1.0)
+        let half = AudioDeviceManager.gainFromScalar(0.5, muted: false)
+        #expect(abs(half - 0.031622776) < 1e-4)
+    }
 }

@@ -3,7 +3,7 @@ import PackageDescription
 
 let package = Package(
     name: "HDMIVolume",
-    platforms: [.macOS(.v14)],
+    platforms: [.macOS(.v15)],
     products: [
         .library(name: "HDMIVolumeCore", targets: ["HDMIVolumeCore"]),
         .executable(name: "HDMIVolume", targets: ["HDMIVolumeApp"])

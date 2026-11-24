@@ -2,13 +2,19 @@ import AudioToolbox
 import CoreAudio
 import Foundation
 
-/// Bridges audio from the virtual HDMI Volume loopback input to a physical output device.
+/// Bridges system audio via CoreAudio Process Tap (no microphone indicator) to a physical output device,
+/// scaling output in real time from the virtual HDMI Volume device's volume and mute controls.
 public final class AudioBridge: @unchecked Sendable {
-    private var inputUnit: AudioUnit?
+    private var tapID: AudioObjectID = kAudioObjectUnknown
+    private var aggregateDeviceID: AudioDeviceID = kAudioObjectUnknown
+    private var tapIOProcID: AudioDeviceIOProcID?
     private var outputUnit: AudioUnit?
+
     private let ring = FloatRingBuffer(capacityFrames: 4096, maxLatencyFrames: 768, channels: 2)
-    private var inputScratch = [Float](repeating: 0, count: 4096 * 2)
+    private var gainLock = os_unfair_lock_s()
+    private var currentGain: Float = 0.75
     private var isRunning = false
+    private var listenerDeviceID: AudioDeviceID = kAudioObjectUnknown
 
     public private(set) var sourceDeviceID: AudioDeviceID?
     public private(set) var targetDeviceID: AudioDeviceID?
@@ -23,30 +29,56 @@ public final class AudioBridge: @unchecked Sendable {
         stop()
         ring.reset()
 
-        guard let inUnit = createHALUnit(deviceID: sourceDeviceID, isInput: true),
-              let outUnit = createHALUnit(deviceID: targetDeviceID, isInput: false) else {
+        refreshGain(from: sourceDeviceID)
+
+        let excludeProcesses: [AudioObjectID]
+        if let selfObj = AudioDeviceManager.currentProcessAudioObjectID() {
+            excludeProcesses = [selfObj]
+        } else {
+            excludeProcesses = []
+        }
+
+        let tapDesc = CATapDescription(stereoGlobalTapButExcludeProcesses: excludeProcesses)
+        let tapUUID = UUID()
+        tapDesc.uuid = tapUUID
+        tapDesc.name = "HDMIVolumeTap"
+        tapDesc.isPrivate = true
+        tapDesc.muteBehavior = .unmuted
+
+        var createdTapID: AudioObjectID = kAudioObjectUnknown
+        guard AudioHardwareCreateProcessTap(tapDesc, &createdTapID) == noErr,
+              createdTapID != kAudioObjectUnknown else {
+            return false
+        }
+
+        let aggDesc: [String: Any] = [
+            kAudioAggregateDeviceNameKey: "HDMIVolumeTapDevice",
+            kAudioAggregateDeviceUIDKey: "com.hdmivolume.tap.\(tapUUID.uuidString)",
+            kAudioAggregateDeviceIsPrivateKey: true,
+            kAudioAggregateDeviceIsStackedKey: false,
+            kAudioAggregateDeviceTapAutoStartKey: true,
+            kAudioAggregateDeviceTapListKey: [
+                [
+                    kAudioSubTapUIDKey: tapUUID.uuidString,
+                    kAudioSubTapDriftCompensationKey: true
+                ]
+            ]
+        ]
+
+        var createdAggID: AudioDeviceID = kAudioObjectUnknown
+        guard AudioHardwareCreateAggregateDevice(aggDesc as CFDictionary, &createdAggID) == noErr,
+              createdAggID != kAudioObjectUnknown else {
+            AudioHardwareDestroyProcessTap(createdTapID)
+            return false
+        }
+
+        guard let outUnit = createOutputHALUnit(deviceID: targetDeviceID) else {
+            AudioHardwareDestroyAggregateDevice(createdAggID)
+            AudioHardwareDestroyProcessTap(createdTapID)
             return false
         }
 
         let selfPtr = Unmanaged.passUnretained(self).toOpaque()
-
-        var inCallback = AURenderCallbackStruct(
-            inputProc: inputRenderCallback,
-            inputProcRefCon: selfPtr
-        )
-        guard AudioUnitSetProperty(
-            inUnit,
-            kAudioOutputUnitProperty_SetInputCallback,
-            kAudioUnitScope_Global,
-            0,
-            &inCallback,
-            UInt32(MemoryLayout<AURenderCallbackStruct>.size)
-        ) == noErr else {
-            disposeUnit(inUnit)
-            disposeUnit(outUnit)
-            return false
-        }
-
         var outCallback = AURenderCallbackStruct(
             inputProc: outputRenderCallback,
             inputProcRefCon: selfPtr
@@ -59,48 +91,126 @@ public final class AudioBridge: @unchecked Sendable {
             &outCallback,
             UInt32(MemoryLayout<AURenderCallbackStruct>.size)
         ) == noErr else {
-            disposeUnit(inUnit)
             disposeUnit(outUnit)
+            AudioHardwareDestroyAggregateDevice(createdAggID)
+            AudioHardwareDestroyProcessTap(createdTapID)
             return false
         }
 
-        setPreferredBufferSize(deviceID: sourceDeviceID, frames: 256)
+        var procID: AudioDeviceIOProcID?
+        let ioProcStatus = AudioDeviceCreateIOProcIDWithBlock(&procID, createdAggID, nil) { [weak self] _, inInputData, _, _, _ in
+            guard let self, self.isRunning else { return }
+            let buffers = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: inInputData))
+            guard let first = buffers.first, let data = first.mData else { return }
+            let sampleCount = Int(first.mDataByteSize) / MemoryLayout<Float>.size
+            guard sampleCount > 0 else { return }
+            let floatPtr = data.assumingMemoryBound(to: Float.self)
+            self.ring.write(floatPtr, count: sampleCount)
+        }
+
+        guard ioProcStatus == noErr, let procID else {
+            disposeUnit(outUnit)
+            AudioHardwareDestroyAggregateDevice(createdAggID)
+            AudioHardwareDestroyProcessTap(createdTapID)
+            return false
+        }
+
         setPreferredBufferSize(deviceID: targetDeviceID, frames: 256)
+        setPreferredBufferSize(deviceID: createdAggID, frames: 256)
 
         guard AudioUnitInitialize(outUnit) == noErr,
-              AudioUnitInitialize(inUnit) == noErr,
               AudioOutputUnitStart(outUnit) == noErr,
-              AudioOutputUnitStart(inUnit) == noErr else {
-            disposeUnit(inUnit)
+              AudioDeviceStart(createdAggID, procID) == noErr else {
+            AudioDeviceDestroyIOProcID(createdAggID, procID)
             disposeUnit(outUnit)
+            AudioHardwareDestroyAggregateDevice(createdAggID)
+            AudioHardwareDestroyProcessTap(createdTapID)
             return false
         }
 
-        self.inputUnit = inUnit
+        self.tapID = createdTapID
+        self.aggregateDeviceID = createdAggID
+        self.tapIOProcID = procID
         self.outputUnit = outUnit
         self.sourceDeviceID = sourceDeviceID
         self.targetDeviceID = targetDeviceID
         self.isRunning = true
+
+        installVolumeListeners(on: sourceDeviceID)
         return true
     }
 
     public func stop() {
         isRunning = false
-        if let inUnit = inputUnit {
-            AudioOutputUnitStop(inUnit)
-            disposeUnit(inUnit)
-            inputUnit = nil
+        removeVolumeListeners()
+
+        if aggregateDeviceID != kAudioObjectUnknown, let procID = tapIOProcID {
+            AudioDeviceStop(aggregateDeviceID, procID)
+            AudioDeviceDestroyIOProcID(aggregateDeviceID, procID)
+            tapIOProcID = nil
         }
         if let outUnit = outputUnit {
             AudioOutputUnitStop(outUnit)
             disposeUnit(outUnit)
             outputUnit = nil
         }
+        if aggregateDeviceID != kAudioObjectUnknown {
+            AudioHardwareDestroyAggregateDevice(aggregateDeviceID)
+            aggregateDeviceID = kAudioObjectUnknown
+        }
+        if tapID != kAudioObjectUnknown {
+            AudioHardwareDestroyProcessTap(tapID)
+            tapID = kAudioObjectUnknown
+        }
         sourceDeviceID = nil
         targetDeviceID = nil
     }
 
-    private func createHALUnit(deviceID: AudioDeviceID, isInput: Bool) -> AudioUnit? {
+    fileprivate func refreshGain(from deviceID: AudioDeviceID) {
+        let scalar = AudioDeviceManager.readVolumeScalar(deviceID: deviceID)
+        let muted = AudioDeviceManager.readMute(deviceID: deviceID)
+        let gain = AudioDeviceManager.gainFromScalar(scalar, muted: muted)
+        os_unfair_lock_lock(&gainLock)
+        currentGain = gain
+        os_unfair_lock_unlock(&gainLock)
+    }
+
+    private func installVolumeListeners(on deviceID: AudioDeviceID) {
+        listenerDeviceID = deviceID
+        let selfPtr = Unmanaged.passUnretained(self).toOpaque()
+        var volAddr = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyVolumeScalar,
+            mScope: kAudioObjectPropertyScopeOutput,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var muteAddr = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyMute,
+            mScope: kAudioObjectPropertyScopeOutput,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        AudioObjectAddPropertyListener(deviceID, &volAddr, volumePropertyListener, selfPtr)
+        AudioObjectAddPropertyListener(deviceID, &muteAddr, volumePropertyListener, selfPtr)
+    }
+
+    private func removeVolumeListeners() {
+        guard listenerDeviceID != kAudioObjectUnknown else { return }
+        let selfPtr = Unmanaged.passUnretained(self).toOpaque()
+        var volAddr = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyVolumeScalar,
+            mScope: kAudioObjectPropertyScopeOutput,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var muteAddr = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyMute,
+            mScope: kAudioObjectPropertyScopeOutput,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        AudioObjectRemovePropertyListener(listenerDeviceID, &volAddr, volumePropertyListener, selfPtr)
+        AudioObjectRemovePropertyListener(listenerDeviceID, &muteAddr, volumePropertyListener, selfPtr)
+        listenerDeviceID = kAudioObjectUnknown
+    }
+
+    private func createOutputHALUnit(deviceID: AudioDeviceID) -> AudioUnit? {
         var desc = AudioComponentDescription(
             componentType: kAudioUnitType_Output,
             componentSubType: kAudioUnitSubType_HALOutput,
@@ -114,13 +224,8 @@ public final class AudioBridge: @unchecked Sendable {
 
         var enableIO: UInt32 = 1
         var disableIO: UInt32 = 0
-        if isInput {
-            AudioUnitSetProperty(au, kAudioOutputUnitProperty_EnableIO, kAudioUnitScope_Input, 1, &enableIO, 4)
-            AudioUnitSetProperty(au, kAudioOutputUnitProperty_EnableIO, kAudioUnitScope_Output, 0, &disableIO, 4)
-        } else {
-            AudioUnitSetProperty(au, kAudioOutputUnitProperty_EnableIO, kAudioUnitScope_Output, 0, &enableIO, 4)
-            AudioUnitSetProperty(au, kAudioOutputUnitProperty_EnableIO, kAudioUnitScope_Input, 1, &disableIO, 4)
-        }
+        AudioUnitSetProperty(au, kAudioOutputUnitProperty_EnableIO, kAudioUnitScope_Output, 0, &enableIO, 4)
+        AudioUnitSetProperty(au, kAudioOutputUnitProperty_EnableIO, kAudioUnitScope_Input, 1, &disableIO, 4)
 
         var devID = deviceID
         guard AudioUnitSetProperty(
@@ -146,13 +251,11 @@ public final class AudioBridge: @unchecked Sendable {
             mBitsPerChannel: 32,
             mReserved: 0
         )
-        let scope: AudioUnitScope = isInput ? kAudioUnitScope_Output : kAudioUnitScope_Input
-        let bus: AudioUnitElement = isInput ? 1 : 0
         guard AudioUnitSetProperty(
             au,
             kAudioUnitProperty_StreamFormat,
-            scope,
-            bus,
+            kAudioUnitScope_Input,
+            0,
             &asbd,
             UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
         ) == noErr else {
@@ -178,35 +281,6 @@ public final class AudioBridge: @unchecked Sendable {
         AudioComponentInstanceDispose(unit)
     }
 
-    fileprivate func handleInput(
-        ioActionFlags: UnsafeMutablePointer<AudioUnitRenderActionFlags>,
-        inTimeStamp: UnsafePointer<AudioTimeStamp>,
-        inBusNumber: UInt32,
-        inNumberFrames: UInt32
-    ) -> OSStatus {
-        guard isRunning, let inUnit = inputUnit else { return noErr }
-        let sampleCount = Int(inNumberFrames) * 2
-        if inputScratch.count < sampleCount {
-            inputScratch = [Float](repeating: 0, count: sampleCount)
-        }
-
-        return inputScratch.withUnsafeMutableBufferPointer { buf in
-            var abl = AudioBufferList(
-                mNumberBuffers: 1,
-                mBuffers: AudioBuffer(
-                    mNumberChannels: 2,
-                    mDataByteSize: UInt32(sampleCount * MemoryLayout<Float>.size),
-                    mData: buf.baseAddress
-                )
-            )
-            let status = AudioUnitRender(inUnit, ioActionFlags, inTimeStamp, inBusNumber, inNumberFrames, &abl)
-            if status == noErr, let base = buf.baseAddress {
-                ring.write(base, count: sampleCount)
-            }
-            return status
-        }
-    }
-
     fileprivate func handleOutput(
         inNumberFrames: UInt32,
         ioData: UnsafeMutablePointer<AudioBufferList>?
@@ -216,8 +290,17 @@ public final class AudioBridge: @unchecked Sendable {
         guard let first = buffers.first, let data = first.mData else { return noErr }
         let sampleCount = Int(inNumberFrames) * 2
         let floatPtr = data.assumingMemoryBound(to: Float.self)
+
         if isRunning {
             ring.read(into: floatPtr, count: sampleCount)
+            os_unfair_lock_lock(&gainLock)
+            let gain = currentGain
+            os_unfair_lock_unlock(&gainLock)
+            if gain != 1.0 {
+                for i in 0..<sampleCount {
+                    floatPtr[i] *= gain
+                }
+            }
         } else {
             for i in 0..<sampleCount { floatPtr[i] = 0 }
         }
@@ -225,21 +308,16 @@ public final class AudioBridge: @unchecked Sendable {
     }
 }
 
-private func inputRenderCallback(
-    inRefCon: UnsafeMutableRawPointer,
-    ioActionFlags: UnsafeMutablePointer<AudioUnitRenderActionFlags>,
-    inTimeStamp: UnsafePointer<AudioTimeStamp>,
-    inBusNumber: UInt32,
-    inNumberFrames: UInt32,
-    ioData: UnsafeMutablePointer<AudioBufferList>?
+private func volumePropertyListener(
+    inObjectID: AudioObjectID,
+    inNumberAddresses: UInt32,
+    inAddresses: UnsafePointer<AudioObjectPropertyAddress>,
+    inClientData: UnsafeMutableRawPointer?
 ) -> OSStatus {
-    let bridge = Unmanaged<AudioBridge>.fromOpaque(inRefCon).takeUnretainedValue()
-    return bridge.handleInput(
-        ioActionFlags: ioActionFlags,
-        inTimeStamp: inTimeStamp,
-        inBusNumber: inBusNumber,
-        inNumberFrames: inNumberFrames
-    )
+    guard let inClientData else { return noErr }
+    let bridge = Unmanaged<AudioBridge>.fromOpaque(inClientData).takeUnretainedValue()
+    bridge.refreshGain(from: inObjectID)
+    return noErr
 }
 
 private func outputRenderCallback(
