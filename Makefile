@@ -17,8 +17,9 @@ driver:
 
 app:
 	cd App && swift build -c release
-	@mkdir -p $(APP_BUNDLE)/Contents/MacOS
+	@mkdir -p $(APP_BUNDLE)/Contents/MacOS $(APP_BUNDLE)/Contents/Resources
 	@cp App/Info.plist $(APP_BUNDLE)/Contents/Info.plist
+	@cp App/Resources/AppIcon.icns $(APP_BUNDLE)/Contents/Resources/AppIcon.icns
 	@cp App/.build/release/HDMIVolume $(APP_BUNDLE)/Contents/MacOS/HDMIVolume
 	@codesign --force --sign - $(APP_BUNDLE)
 

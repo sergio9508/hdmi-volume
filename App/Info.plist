@@ -6,6 +6,8 @@
     <string>en</string>
     <key>CFBundleExecutable</key>
     <string>HDMIVolume</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
     <key>CFBundleIdentifier</key>
     <string>com.hdmivolume.app</string>
     <key>CFBundleInfoDictionaryVersion</key>
@@ -20,5 +22,7 @@
     <string>1</string>
     <key>LSUIElement</key>
     <true/>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>HDMIVolume needs audio input access to read the virtual HDMI Volume loopback stream and forward it to your external display.</string>
 </dict>
 </plist>

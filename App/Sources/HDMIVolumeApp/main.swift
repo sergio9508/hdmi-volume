@@ -1,4 +1,5 @@
 import AppKit
+import AVFoundation
 import CoreAudio
 import Foundation
 import HDMIVolumeCore
@@ -42,8 +43,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             createStatusItem()
         }
 
-        startBridgeIfPossible()
+        requestAudioPermissionAndStart()
         installDeviceChangeListener()
+    }
+
+    private func requestAudioPermissionAndStart() {
+        switch AVCaptureDevice.authorizationStatus(for: .audio) {
+        case .authorized:
+            startBridgeIfPossible()
+        case .notDetermined:
+            AVCaptureDevice.requestAccess(for: .audio) { [weak self] granted in
+                DispatchQueue.main.async {
+                    if granted {
+                        self?.startBridgeIfPossible()
+                    } else {
+                        self?.rebuildMenu()
+                    }
+                }
+            }
+        case .denied, .restricted:
+            rebuildMenu()
+        @unknown default:
+            startBridgeIfPossible()
+        }
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
