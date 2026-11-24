@@ -1,17 +1,20 @@
 import Foundation
 
-/// Lock-protected stereo Float32 ring buffer used between input and output AUHAL callbacks.
+/// Lock-protected stereo Float32 ring buffer with bounded max latency to prevent standing audio delay.
 public final class FloatRingBuffer: @unchecked Sendable {
     private var buffer: [Float]
     private let capacitySamples: Int
+    private let maxLatencySamples: Int
     private var writeIndex: Int = 0
     private var readIndex: Int = 0
     private var availableSamples: Int = 0
     private var lock = os_unfair_lock_s()
 
-    public init(capacityFrames: Int = 16384, channels: Int = 2) {
-        self.capacitySamples = max(1, capacityFrames * channels)
-        self.buffer = [Float](repeating: 0, count: self.capacitySamples)
+    public init(capacityFrames: Int = 4096, maxLatencyFrames: Int = 768, channels: Int = 2) {
+        let cap = max(1, capacityFrames * channels)
+        self.capacitySamples = cap
+        self.maxLatencySamples = min(cap, max(channels, maxLatencyFrames * channels))
+        self.buffer = [Float](repeating: 0, count: cap)
     }
 
     public func reset() {
@@ -25,16 +28,16 @@ public final class FloatRingBuffer: @unchecked Sendable {
     public func write(_ source: UnsafePointer<Float>, count: Int) {
         guard count > 0 else { return }
         os_unfair_lock_lock(&lock)
-        if count >= capacitySamples {
-            let start = count - capacitySamples
-            for i in 0..<capacitySamples {
+        if count >= maxLatencySamples {
+            let start = count - maxLatencySamples
+            for i in 0..<maxLatencySamples {
                 buffer[i] = source[start + i]
             }
             readIndex = 0
-            writeIndex = 0
-            availableSamples = capacitySamples
+            writeIndex = maxLatencySamples % capacitySamples
+            availableSamples = maxLatencySamples
         } else {
-            let overflow = (availableSamples + count) - capacitySamples
+            let overflow = (availableSamples + count) - maxLatencySamples
             if overflow > 0 {
                 readIndex = (readIndex + overflow) % capacitySamples
                 availableSamples -= overflow

@@ -6,7 +6,7 @@ import Foundation
 public final class AudioBridge: @unchecked Sendable {
     private var inputUnit: AudioUnit?
     private var outputUnit: AudioUnit?
-    private let ring = FloatRingBuffer(capacityFrames: 16384, channels: 2)
+    private let ring = FloatRingBuffer(capacityFrames: 4096, maxLatencyFrames: 768, channels: 2)
     private var inputScratch = [Float](repeating: 0, count: 4096 * 2)
     private var isRunning = false
 
@@ -64,10 +64,13 @@ public final class AudioBridge: @unchecked Sendable {
             return false
         }
 
-        guard AudioUnitInitialize(inUnit) == noErr,
-              AudioUnitInitialize(outUnit) == noErr,
-              AudioOutputUnitStart(inUnit) == noErr,
-              AudioOutputUnitStart(outUnit) == noErr else {
+        setPreferredBufferSize(deviceID: sourceDeviceID, frames: 256)
+        setPreferredBufferSize(deviceID: targetDeviceID, frames: 256)
+
+        guard AudioUnitInitialize(outUnit) == noErr,
+              AudioUnitInitialize(inUnit) == noErr,
+              AudioOutputUnitStart(outUnit) == noErr,
+              AudioOutputUnitStart(inUnit) == noErr else {
             disposeUnit(inUnit)
             disposeUnit(outUnit)
             return false
@@ -158,6 +161,16 @@ public final class AudioBridge: @unchecked Sendable {
         }
 
         return au
+    }
+
+    private func setPreferredBufferSize(deviceID: AudioDeviceID, frames: UInt32) {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyBufferFrameSize,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var size = frames
+        AudioObjectSetPropertyData(deviceID, &address, 0, nil, UInt32(MemoryLayout<UInt32>.size), &size)
     }
 
     private func disposeUnit(_ unit: AudioUnit) {

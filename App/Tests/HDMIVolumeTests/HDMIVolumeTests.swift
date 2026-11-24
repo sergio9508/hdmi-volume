@@ -71,4 +71,17 @@ struct HDMIVolumeTests {
         #expect(output[4] == 0.0)
         #expect(output[5] == 0.0)
     }
+
+    @Test("FloatRingBuffer caps standing latency to maxLatencyFrames")
+    func ringBufferLatencyCap() {
+        let ring = FloatRingBuffer(capacityFrames: 16, maxLatencyFrames: 2, channels: 2)
+        let chunk1: [Float] = [1, 1, 2, 2]
+        let chunk2: [Float] = [3, 3, 4, 4]
+        chunk1.withUnsafeBufferPointer { ring.write($0.baseAddress!, count: 4) }
+        chunk2.withUnsafeBufferPointer { ring.write($0.baseAddress!, count: 4) }
+
+        var output = [Float](repeating: -1, count: 4)
+        output.withUnsafeMutableBufferPointer { ring.read(into: $0.baseAddress!, count: 4) }
+        #expect(output == [3, 3, 4, 4])
+    }
 }
