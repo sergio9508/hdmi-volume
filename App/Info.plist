@@ -22,5 +22,7 @@
     <string>1</string>
     <key>LSUIElement</key>
     <true/>
+    <key>NSAudioCaptureUsageDescription</key>
+    <string>HDMIVolume needs system audio capture access to forward audio to your external HDMI display with keyboard volume control.</string>
 </dict>
 </plist>
